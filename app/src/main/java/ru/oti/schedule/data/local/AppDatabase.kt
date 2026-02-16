@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 
 @Database(
     entities = [UserLessonEntity::class, HiddenLessonEntity::class, AttendanceEntity::class],
-    version = 5, // Увеличили версию для окончательного исправления структуры
+    version = 6, // Увеличили версию после добавления индекса для attendance
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {

@@ -6,7 +6,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import ru.oti.schedule.data.ScheduleRepository
 import ru.oti.schedule.data.local.AppDatabase
@@ -16,11 +18,10 @@ import ru.oti.schedule.data.local.UserLessonEntity
 import ru.oti.schedule.model.Lesson
 import ru.oti.schedule.model.ScheduleFile
 import ru.oti.schedule.ui.theme.*
-import java.security.MessageDigest
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.temporal.WeekFields
-import java.util.*
+import java.util.Locale
 
 enum class LessonSource { OFFICIAL, USER }
 
@@ -58,15 +59,16 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _schedule = MutableStateFlow<ScheduleFile?>(null)
     private val _officialLessonsGrouped = MutableStateFlow<Map<String, List<UiLesson>>>(emptyMap())
+    private val userLessonsCache = mutableMapOf<Long, UiLesson>()
     private val _isLoading = MutableStateFlow(true)
     private val _isOddWeek = MutableStateFlow(calculateIsOddWeek())
     private val _currentTime = MutableStateFlow(LocalTime.now())
     val currentTime: StateFlow<LocalTime> = _currentTime.asStateFlow()
 
     private val databaseFlow = combine(
-        userDao.observeAll(),
-        hiddenDao.observeKeys().map { it.toSet() },
-        attendanceDao.observeAll()
+        userDao.observeAll().distinctUntilChanged(),
+        hiddenDao.observeKeys().map { it.toSet() }.distinctUntilChanged(),
+        attendanceDao.observeAll().distinctUntilChanged()
     ) { userLessons, hiddenKeys, attendance ->
         Triple(userLessons, hiddenKeys, attendance)
     }
@@ -82,7 +84,13 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         if (loading) return@combine DayUiState(isLoading = true)
 
         val (userLessons, hiddenKeys, attendance) = dbData
-        val userLessonsGrouped = userLessons.map { getUiLessonFromUserEntity(it) }.groupBy { it.lesson.day }
+        val activeUserLessonIds = userLessons.asSequence().map { it.id }.toSet()
+        userLessonsCache.keys.retainAll(activeUserLessonIds)
+
+        val userLessonsGrouped = userLessons
+            .asSequence()
+            .map { getCachedUiLessonFromUserEntity(it) }
+            .groupBy { it.lesson.day }
         
         val finalMap = dayOrder.associateWith { day ->
             val official = officialGrouped[day].orEmpty().filter { uiLesson ->
@@ -144,13 +152,13 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun startClock() {
         viewModelScope.launch {
-            while(true) {
+            while (isActive) {
                 val now = LocalTime.now()
                 if (now.minute != _currentTime.value.minute) {
                     _currentTime.value = now
                     _isOddWeek.value = calculateIsOddWeek()
                 }
-                kotlinx.coroutines.delay(20000)
+                delay(20_000)
             }
         }
     }
@@ -184,9 +192,16 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun generateLessonKey(lesson: Lesson): String {
-        val normalizedTime = lesson.time.replace(Regex("[\\s–—]"), "-").trim()
-        val raw = "${lesson.day.trim().uppercase()}|${normalizedTime}|${lesson.subject.trim().uppercase()}|${lesson.type.orEmpty().uppercase()}|${lesson.weekType.orEmpty().uppercase()}"
-        return MessageDigest.getInstance("SHA-1").digest(raw.toByteArray()).joinToString("") { "%02x".format(it) }
+        val normalizedDay = lesson.day.trim().uppercase()
+        val normalizedTime = lesson.time
+            .replace("–", "-")
+            .replace("—", "-")
+            .replace(" ", "")
+            .trim()
+        val normalizedSubject = lesson.subject.trim().uppercase()
+        val normalizedType = lesson.type.orEmpty().trim().uppercase()
+        val normalizedWeekType = lesson.weekType.orEmpty().trim().uppercase()
+        return "$normalizedDay|$normalizedTime|$normalizedSubject|$normalizedType|$normalizedWeekType"
     }
 
     fun lessonKey(lesson: Lesson): String = generateLessonKey(lesson)
@@ -216,7 +231,11 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteUserLesson(entity: UserLessonEntity) { viewModelScope.launch { userDao.delete(entity) } }
     fun hideOfficialLesson(lesson: Lesson) { viewModelScope.launch { hiddenDao.hide(HiddenLessonEntity(lessonKey = generateLessonKey(lesson))) } }
     fun unhideOfficialLessonByKey(key: String) { viewModelScope.launch { hiddenDao.unhide(key) } }
-    fun clearAllData() { viewModelScope.launch { hiddenDao.clearAll(); userDao.clearAll(); attendanceDao.clearAll() } }
+    fun clearAllData() {
+        viewModelScope.launch(Dispatchers.IO) {
+            clearAllDataInternal()
+        }
+    }
 
     fun toLesson(entity: UserLessonEntity): Lesson = Lesson(day = entity.day, time = "${entity.startTime}-${entity.endTime}", subject = entity.subject, type = entity.type, teacher = entity.teacher, room = entity.room)
 
@@ -226,26 +245,38 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         return UiLesson(lesson = l, source = LessonSource.USER, userEntity = entity, stableKey = generateLessonKey(l), startTime = s, endTime = e, subjectColor = getSubjectColor(l.subject))
     }
 
+
+    private fun getCachedUiLessonFromUserEntity(entity: UserLessonEntity): UiLesson {
+        return userLessonsCache[entity.id]?.takeIf { it.userEntity == entity }
+            ?: getUiLessonFromUserEntity(entity).also { userLessonsCache[entity.id] = it }
+    }
+
+
+    private suspend fun clearAllDataInternal() {
+        hiddenDao.clearAll()
+        userDao.clearAll()
+        attendanceDao.clearAll()
+        userLessonsCache.clear()
+    }
+
     private fun checkScheduleVersion(currentSchedule: ScheduleFile) {
         val v = currentSchedule.generated_from
         if (prefs.getString("last_schedule_version", null) != v) {
-            viewModelScope.launch { clearAllData(); prefs.edit().putString("last_schedule_version", v).apply() }
+            viewModelScope.launch(Dispatchers.IO) {
+                clearAllDataInternal()
+                prefs.edit().putString("last_schedule_version", v).apply()
+            }
         }
     }
 
     private fun cleanupOldTasks() {
-        val now = LocalDate.now()
-        val firstDayOfCurrentMonth = now.withDayOfMonth(1)
-        viewModelScope.launch {
+        val firstDayOfCurrentMonth = LocalDate.now().withDayOfMonth(1)
+        viewModelScope.launch(Dispatchers.IO) {
             userDao.observeAll().first().forEach { task ->
                 if (task.isCompleted && task.completedAt != null) {
-                    try { 
-                        val completedDate = LocalDate.parse(task.completedAt)
-                        if (completedDate.isBefore(firstDayOfCurrentMonth)) {
-                            userDao.delete(task)
-                        }
-                    } catch (e: Exception) { 
-                        userDao.delete(task) 
+                    val completedDate = runCatching { LocalDate.parse(task.completedAt) }.getOrNull()
+                    if (completedDate == null || completedDate.isBefore(firstDayOfCurrentMonth)) {
+                        userDao.delete(task)
                     }
                 }
             }

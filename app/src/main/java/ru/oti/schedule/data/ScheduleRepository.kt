@@ -12,9 +12,19 @@ class ScheduleRepository(private val context: Context) {
         ignoreUnknownKeys = true
     }
 
-    // Сделали функцию приостанавливаемой (suspend)
-    suspend fun loadSchedule(): ScheduleFile = withContext(Dispatchers.IO) {
-        val text = context.assets.open("schedule.json").bufferedReader(Charsets.UTF_8).use { it.readText() }
-        json.decodeFromString(ScheduleFile.serializer(), text)
+    suspend fun loadSchedule(): ScheduleFile = cachedSchedule ?: withContext(Dispatchers.IO) {
+        cachedSchedule ?: run {
+            val text = context.assets.open("schedule.json")
+                .bufferedReader(Charsets.UTF_8)
+                .use { it.readText() }
+            json.decodeFromString(ScheduleFile.serializer(), text).also { parsed ->
+                cachedSchedule = parsed
+            }
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var cachedSchedule: ScheduleFile? = null
     }
 }
