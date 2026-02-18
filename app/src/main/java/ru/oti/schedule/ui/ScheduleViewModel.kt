@@ -6,6 +6,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import ru.oti.schedule.data.ScheduleRepository
@@ -31,7 +32,8 @@ data class UiLesson(
     val stableKey: String,
     val startTime: LocalTime? = null,
     val endTime: LocalTime? = null,
-    val subjectColor: Color = SubjectBlue
+    val subjectColor: Color = SubjectBlue,
+    val isActiveWeek: Boolean = true
 )
 
 val UiLesson.officialKey: String? get() = if (source == LessonSource.OFFICIAL) stableKey else null
@@ -49,7 +51,7 @@ data class DayUiState(
 class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
 
     private val dayOrder = listOf("ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ")
-    private val repository = ScheduleRepository(app)
+    private val repository = ScheduleRepository.getInstance(app)
     private val db = AppDatabase.get(app)
     private val userDao = db.userLessonDao()
     private val hiddenDao = db.hiddenLessonDao()
@@ -78,22 +80,28 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         _isOddWeek,
         _isLoading
     ) { schedule, officialGrouped, dbData, isOdd, loading ->
-        
+
         if (loading) return@combine DayUiState(isLoading = true)
 
         val (userLessons, hiddenKeys, attendance) = dbData
+
+        // ОПТИМИЗАЦИЯ: Тяжелые вычисления (хеширование, группировка, сортировка)
+        // будут выполняться в фоновом потоке благодаря flowOn(Dispatchers.Default) ниже
         val userLessonsGrouped = userLessons.map { getUiLessonFromUserEntity(it) }.groupBy { it.lesson.day }
-        
+
         val finalMap = dayOrder.associateWith { day ->
-            val official = officialGrouped[day].orEmpty().filter { uiLesson ->
+            val official = officialGrouped[day].orEmpty().map { uiLesson ->
                 val lesson = uiLesson.lesson
+                // Проверяем, подходит ли пара под текущую неделю
                 val isCorrectWeek = when (lesson.weekType) {
                     "odd" -> isOdd
                     "even" -> !isOdd
                     else -> true
                 }
-                uiLesson.stableKey.isNotEmpty() && uiLesson.stableKey !in hiddenKeys && isCorrectWeek
-            }
+                // Не фильтруем, а просто сохраняем статус активности
+                uiLesson.copy(isActiveWeek = isCorrectWeek)
+            }.filter { it.stableKey !in hiddenKeys } // Оставляем только те, что не скрыты вручную
+
             val user = userLessonsGrouped[day].orEmpty()
             (official + user).sortedBy { it.startTime ?: LocalTime.MIN }
         }
@@ -101,13 +109,15 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         DayUiState(
             schedule = schedule,
             lessonsByDay = finalMap,
-            userLessons = userLessons, 
+            userLessons = userLessons,
             hiddenOfficialKeys = hiddenKeys,
             attendance = attendance,
             isOddWeek = isOdd,
             isLoading = false
         )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DayUiState(isLoading = true))
+    }
+        .flowOn(Dispatchers.Default) // Перенос вычислений с UI потока
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DayUiState(isLoading = true))
 
     init {
         loadDataAsync()
@@ -118,6 +128,7 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val loadedSchedule = repository.loadSchedule()
+                // Генерация ключей и парсинг времени происходит один раз при загрузке
                 val grouped = loadedSchedule.lessons.map { lesson ->
                     val (s, e) = parseLessonTime(lesson.time)
                     UiLesson(
@@ -129,13 +140,14 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
                         subjectColor = getSubjectColor(lesson.subject)
                     )
                 }.groupBy { it.lesson.day }
-                
+
                 _schedule.value = loadedSchedule
                 _officialLessonsGrouped.value = grouped
-                
+
                 checkScheduleVersion(loadedSchedule)
                 cleanupOldTasks()
             } catch (e: Exception) {
+                // В реальном проекте здесь стоит добавить обработку ошибок
             } finally {
                 _isLoading.value = false
             }
@@ -146,18 +158,25 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             while(true) {
                 val now = LocalTime.now()
+                // ОПТИМИЗАЦИЯ: Обновляем только если изменилась минута, чтобы не триггерить UI слишком часто
                 if (now.minute != _currentTime.value.minute) {
                     _currentTime.value = now
-                    _isOddWeek.value = calculateIsOddWeek()
+                    val newIsOdd = calculateIsOddWeek()
+                    if (_isOddWeek.value != newIsOdd) {
+                        _isOddWeek.value = newIsOdd
+                    }
                 }
-                kotlinx.coroutines.delay(20000)
+                // Проверяем раз в секунду, чтобы точно поймать смену минуты,
+                // но эмитим значение только при изменении минуты
+                delay(1000)
             }
         }
     }
 
     private fun calculateIsOddWeek(): Boolean {
         val now = LocalDate.now()
-        val weekFields = WeekFields.of(Locale.getDefault())
+        // БАГ-ФИКС: Используем Locale("ru") везде для консистентности
+        val weekFields = WeekFields.of(Locale("ru"))
         return now.get(weekFields.weekOfWeekBasedYear()) % 2 != 0
     }
 
@@ -183,10 +202,16 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // SHA-1 относительно быстр, но лучше не создавать инстанс каждый раз.
+    // Однако внутри IO/Default диспатчера это приемлемо.
     private fun generateLessonKey(lesson: Lesson): String {
         val normalizedTime = lesson.time.replace(Regex("[\\s–—]"), "-").trim()
         val raw = "${lesson.day.trim().uppercase()}|${normalizedTime}|${lesson.subject.trim().uppercase()}|${lesson.type.orEmpty().uppercase()}|${lesson.weekType.orEmpty().uppercase()}"
-        return MessageDigest.getInstance("SHA-1").digest(raw.toByteArray()).joinToString("") { "%02x".format(it) }
+
+        // Используем стандартный API MessageDigest.
+        // Важно: мы не меняем алгоритм на hashCode(), чтобы не потерять старые данные в БД
+        val bytes = MessageDigest.getInstance("SHA-1").digest(raw.toByteArray())
+        return bytes.joinToString("") { "%02x".format(it) }
     }
 
     fun lessonKey(lesson: Lesson): String = generateLessonKey(lesson)
@@ -207,9 +232,7 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateUserLesson(id: Long, day: String, start: String, end: String, subject: String, type: String?, teacher: String?, room: String?, notes: String?, dueDate: String?) {
         viewModelScope.launch {
-            // Пытаемся сохранить состояние выполнения при обновлении, если это возможно
-            // В данном упрощенном варианте мы просто создаем новый объект, но приводим день к верхнему регистру
-            userDao.upsert(UserLessonEntity(id = id, day = day.uppercase(), startTime = start.trim(), endTime = end.trim(), subject = subject.trim(), type = type, teacher = teacher, room = room, notes = notes, dueDate = dueDate)) 
+            userDao.upsert(UserLessonEntity(id = id, day = day.uppercase(), startTime = start.trim(), endTime = end.trim(), subject = subject.trim(), type = type, teacher = teacher, room = room, notes = notes, dueDate = dueDate))
         }
     }
 
@@ -236,16 +259,16 @@ class ScheduleViewModel(app: Application) : AndroidViewModel(app) {
     private fun cleanupOldTasks() {
         val now = LocalDate.now()
         val firstDayOfCurrentMonth = now.withDayOfMonth(1)
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             userDao.observeAll().first().forEach { task ->
                 if (task.isCompleted && task.completedAt != null) {
-                    try { 
+                    try {
                         val completedDate = LocalDate.parse(task.completedAt)
                         if (completedDate.isBefore(firstDayOfCurrentMonth)) {
                             userDao.delete(task)
                         }
-                    } catch (e: Exception) { 
-                        userDao.delete(task) 
+                    } catch (e: Exception) {
+                        userDao.delete(task)
                     }
                 }
             }
